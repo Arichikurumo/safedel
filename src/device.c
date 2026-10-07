@@ -2,6 +2,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -246,37 +247,59 @@ static int is_system_mount(const char *mnt)
            strcmp(mnt, "/var") == 0 || strcmp(mnt, "/home") == 0;
 }
 
-static int check_holders(const char *dir, const char *name)
+/* Collects safety problems: prints them (verbose) and/or keeps the most important one. */
+struct check {
+    int    verbose;
+    int    problems;
+    int    have_system;
+    char  *reason;
+    size_t len;
+};
+
+static void problem(struct check *c, int system, const char *fmt, ...)
+{
+    char msg[512];
+    va_list ap;
+
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof msg, fmt, ap);
+    va_end(ap);
+    if (c->verbose)
+        fprintf(stderr, "  ✗ %s\n", msg);
+    /* keep the first problem, but let a system-disk problem take precedence */
+    if (c->reason && (c->problems == 0 || (system && !c->have_system)))
+        snprintf(c->reason, c->len, "%s", msg);
+    c->have_system |= system;
+    c->problems++;
+}
+
+static void check_holders(struct check *c, const char *dir, const char *name)
 {
     char p[SYSBUF];
     DIR *dh;
     struct dirent *e;
-    int n = 0;
 
     snprintf(p, sizeof p, "%s/holders", dir);
     dh = opendir(p);
     if (!dh)
-        return 0;
+        return;
     while ((e = readdir(dh))) {
         if (e->d_name[0] == '.')
             continue;
-        fprintf(stderr, "  ✗ %s is in use by %s (device-mapper: LVM / LUKS / RAID)\n", name, e->d_name);
-        n++;
+        problem(c, 0, "%s is held by %s (LVM / LUKS / RAID)", name, e->d_name);
     }
     closedir(dh);
-    return n;
 }
 
-static int check_mounts(const struct devinfo *d)
+static void check_mounts(struct check *c, const struct devinfo *d)
 {
     FILE *f = fopen("/proc/self/mountinfo", "re");
     char *line = NULL;
     size_t cap = 0;
-    int n = 0;
 
     if (!f) {
-        fprintf(stderr, "  ✗ cannot read /proc/self/mountinfo: %s\n", strerror(errno));
-        return 1;
+        problem(c, 0, "cannot read /proc/self/mountinfo: %s", strerror(errno));
+        return;
     }
     while (getline(&line, &cap, f) > 0) {
         unsigned maj, min;
@@ -294,56 +317,48 @@ static int check_mounts(const struct devinfo *d)
         if (!who)
             who = owned_path(d, src);
         if (who) {
-            fprintf(stderr, "  ✗ %s is mounted on %s%s\n", who, mnt,
-                    is_system_mount(mnt) ? "  <-- THIS IS A SYSTEM DISK" : "");
-            n++;
+            int sys = is_system_mount(mnt);
+            problem(c, sys, "%s is mounted on %s%s", who, mnt, sys ? " (SYSTEM DISK)" : "");
         }
     }
     free(line);
     fclose(f);
-    return n;
 }
 
-static int check_swaps(const struct devinfo *d)
+static void check_swaps(struct check *c, const struct devinfo *d)
 {
     FILE *f = fopen("/proc/swaps", "re");
     char line[PATH_MAX + 128], path[PATH_MAX];
-    int n = 0;
 
     if (!f)
-        return 0;
+        return;
     if (!fgets(line, sizeof line, f)) { /* header */
         fclose(f);
-        return 0;
+        return;
     }
     while (fgets(line, sizeof line, f)) {
         const char *who;
         if (sscanf(line, "%4095s", path) != 1)
             continue;
-        if ((who = owned_path(d, path))) {
-            fprintf(stderr, "  ✗ %s is in use as swap\n", who);
-            n++;
-        }
+        if ((who = owned_path(d, path)))
+            problem(c, 0, "%s is in use as swap", who);
     }
     fclose(f);
-    return n;
 }
 
-int device_check_unused(const struct devinfo *d)
+int device_check_unused(const struct devinfo *d, char *reason, size_t len)
 {
+    struct check c = { .verbose = reason == NULL, .reason = reason, .len = len };
     char p[SYSBUF];
-    int problems = 0;
 
-    if (d->read_only) {
-        fprintf(stderr, "  ✗ %s is read-only (write-protected)\n", d->name);
-        problems++;
-    }
-    problems += check_holders(d->syspath, d->name);
+    if (d->read_only)
+        problem(&c, 0, "%s is read-only (write-protected)", d->name);
+    check_holders(&c, d->syspath, d->name);
     for (int i = 0; i < d->nparts; i++) {
         snprintf(p, sizeof p, "%s/%s", d->syspath, d->parts[i].name);
-        problems += check_holders(p, d->parts[i].name);
+        check_holders(&c, p, d->parts[i].name);
     }
-    problems += check_mounts(d);
-    problems += check_swaps(d);
-    return problems ? -1 : 0;
+    check_mounts(&c, d);
+    check_swaps(&c, d);
+    return c.problems ? -1 : 0;
 }

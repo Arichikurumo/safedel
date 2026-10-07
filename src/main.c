@@ -14,22 +14,20 @@
 
 #include "device.h"
 #include "fwerase.h"
-#include "ptable.h"
+#include "safedel.h"
 #include "util.h"
-#include "wipe.h"
-
-#define MAX_PASSES 35
-
-enum method { METHOD_AUTO, METHOD_OVERWRITE, METHOD_FIRMWARE };
+#include "wizard.h"
 
 static void usage(FILE *f, const char *prog)
 {
     fprintf(f,
         "Usage: %s [options] <device>\n"
+        "       %s              (no device: interactive mode)\n"
         "\n"
         "Securely erase a whole disk, then write a fresh, empty partition table.\n"
         "\n"
         "Options:\n"
+        "  -l, --list           list disks and whether they can be erased\n"
         "  -m, --method METHOD  auto (default), overwrite or firmware\n"
         "                         auto: use the drive's firmware erase (NVMe Sanitize /\n"
         "                         Format, ATA Security Erase) on SSDs when supported,\n"
@@ -43,10 +41,11 @@ static void usage(FILE *f, const char *prog)
         "  -h, --help           show this help\n"
         "\n"
         "Examples:\n"
+        "  %s --list\n"
         "  %s --dry-run /dev/sdb\n"
         "  %s --verify /dev/sdb\n"
         "  %s --method overwrite --pattern zero,ones,random --table mbr /dev/sdc\n",
-        prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog);
 }
 
 static void on_signal(int sig)
@@ -105,97 +104,11 @@ static void reread_partitions(const struct devinfo *d)
     close(fd);
 }
 
-int main(int argc, char **argv)
+int safedel_run(const char *path, const struct options *o)
 {
-    static const struct option longopts[] = {
-        { "method",  required_argument, NULL, 'm' },
-        { "passes",  required_argument, NULL, 'n' },
-        { "pattern", required_argument, NULL, 'p' },
-        { "verify",  no_argument,       NULL, 'V' },
-        { "table",   required_argument, NULL, 't' },
-        { "dry-run", no_argument,       NULL, 'd' },
-        { "help",    no_argument,       NULL, 'h' },
-        { NULL, 0, NULL, 0 }
-    };
-    enum method method = METHOD_AUTO;
-    enum table_type table = TABLE_GPT;
-    enum pattern passes[MAX_PASSES] = { PAT_RANDOM };
-    int npasses = 1, verify = 0, dry_run = 0, have_n = 0, have_p = 0;
-    int c;
-
-    setvbuf(stdout, NULL, _IOLBF, 0);
-
-    while ((c = getopt_long(argc, argv, "m:n:p:Vt:dh", longopts, NULL)) != -1) {
-        switch (c) {
-        case 'm':
-            if (strcmp(optarg, "auto") == 0)
-                method = METHOD_AUTO;
-            else if (strcmp(optarg, "overwrite") == 0)
-                method = METHOD_OVERWRITE;
-            else if (strcmp(optarg, "firmware") == 0)
-                method = METHOD_FIRMWARE;
-            else {
-                fprintf(stderr, "safedel: unknown method '%s'\n", optarg);
-                return 2;
-            }
-            break;
-        case 'n': {
-            char *end;
-            long v = strtol(optarg, &end, 10);
-            if (*end || v < 1 || v > MAX_PASSES) {
-                fprintf(stderr, "safedel: --passes must be between 1 and %d\n", MAX_PASSES);
-                return 2;
-            }
-            npasses = (int)v;
-            for (int i = 0; i < npasses; i++)
-                passes[i] = PAT_RANDOM;
-            have_n = 1;
-            break;
-        }
-        case 'p':
-            npasses = parse_patterns(optarg, passes, MAX_PASSES);
-            if (npasses < 1)
-                return 2;
-            have_p = 1;
-            break;
-        case 'V':
-            verify = 1;
-            break;
-        case 't':
-            if (strcmp(optarg, "gpt") == 0)
-                table = TABLE_GPT;
-            else if (strcmp(optarg, "mbr") == 0)
-                table = TABLE_MBR;
-            else if (strcmp(optarg, "none") == 0)
-                table = TABLE_NONE;
-            else {
-                fprintf(stderr, "safedel: unknown table type '%s'\n", optarg);
-                return 2;
-            }
-            break;
-        case 'd':
-            dry_run = 1;
-            break;
-        case 'h':
-            usage(stdout, argv[0]);
-            return 0;
-        default:
-            usage(stderr, argv[0]);
-            return 2;
-        }
-    }
-    if (have_n && have_p) {
-        fprintf(stderr, "safedel: use either --passes or --pattern, not both\n");
-        return 2;
-    }
-    if (optind != argc - 1) {
-        usage(stderr, argv[0]);
-        return 2;
-    }
-
     /* ---- 1. identify the target ------------------------------------- */
     struct devinfo dev;
-    if (device_probe(argv[optind], &dev) != 0)
+    if (device_probe(path, &dev) != 0)
         return 1;
     device_print(&dev);
     printf("\n");
@@ -203,12 +116,12 @@ int main(int argc, char **argv)
     /* ---- 2. safety checks ------------------------------------------- */
     if (dev.is_blockdev) {
         printf("Safety checks:\n");
-        if (device_check_unused(&dev) != 0) {
+        if (device_check_unused(&dev, NULL, 0) != 0) {
             fprintf(stderr, "\nRefusing to erase a device that is in use. Unmount / deactivate it first.\n");
             return 1;
         }
         printf("  ✓ not mounted, not used as swap, not held by LVM / LUKS / RAID\n\n");
-        if (geteuid() != 0 && !dry_run) {
+        if (geteuid() != 0 && !o->dry_run) {
             fprintf(stderr, "safedel: erasing a block device requires root\n");
             return 1;
         }
@@ -219,7 +132,7 @@ int main(int argc, char **argv)
     int fw_ok = 0, use_fw = 0;
 
     memset(&fw, 0, sizeof fw);
-    if (method != METHOD_OVERWRITE) {
+    if (o->method != METHOD_OVERWRITE) {
         if (!dev.is_blockdev) {
             snprintf(fw.why_not, sizeof fw.why_not, "target is a regular file");
         } else if (geteuid() != 0) {
@@ -234,20 +147,20 @@ int main(int argc, char **argv)
             }
         }
     }
-    if (method == METHOD_FIRMWARE) {
+    if (o->method == METHOD_FIRMWARE) {
         if (!fw_ok) {
             fprintf(stderr, "safedel: firmware erase not available: %s\n", fw.why_not);
             return 1;
         }
         use_fw = 1;
-    } else if (method == METHOD_AUTO) {
+    } else if (o->method == METHOD_AUTO) {
         use_fw = fw_ok && dev.rotational == 0;
     }
 
     if (!use_fw && dev.is_blockdev && dev.rotational == 0) {
         printf("WARNING: this is flash storage. Overwriting cannot reach spare or remapped\n"
                "         blocks inside the drive, so fragments of old data may survive.\n");
-        if (method == METHOD_AUTO)
+        if (o->method == METHOD_AUTO)
             printf("         Firmware erase unavailable: %s\n", fw.why_not);
         else
             printf("         Consider --method auto to use the drive's built-in erase.\n");
@@ -264,18 +177,19 @@ int main(int argc, char **argv)
         printf("\n");
         if (fw.kind == FW_ATA_SECURITY_ERASE)
             printf("     (sets the temporary password '%s', which the erase clears again)\n", "safedel");
-        if (verify)
+        if (o->verify)
             printf("     note: --verify applies to overwrite passes only and is ignored here\n");
     } else {
-        for (int i = 0; i < npasses; i++)
-            printf("  %d. Overwrite pass %d/%d: %s\n", step++, i + 1, npasses, pattern_name(passes[i]));
-        if (verify)
+        for (int i = 0; i < o->npasses; i++)
+            printf("  %d. Overwrite pass %d/%d: %s\n", step++, i + 1, o->npasses,
+                   pattern_name(o->passes[i]));
+        if (o->verify)
             printf("  %d. Read back and verify the last pass\n", step++);
     }
-    if (table != TABLE_NONE)
-        printf("  %d. Write an empty %s partition table\n", step++, table_name(table));
+    if (o->table != TABLE_NONE)
+        printf("  %d. Write an empty %s partition table\n", step++, table_name(o->table));
 
-    if (dry_run) {
+    if (o->dry_run) {
         printf("\nDry run: nothing was written.\n");
         return 0;
     }
@@ -316,7 +230,7 @@ int main(int argc, char **argv)
     printf("\n");
     double t0 = now_seconds();
     int rc = use_fw ? fwerase_run(fd, &dev, &fw)
-                    : wipe_run(fd, &dev, passes, npasses, verify);
+                    : wipe_run(fd, &dev, o->passes, o->npasses, o->verify);
     if (rc != 0) {
         close(fd);
         if (rc == WIPE_INTERRUPTED) {
@@ -328,13 +242,13 @@ int main(int argc, char **argv)
     }
 
     /* ---- 7. partition table ----------------------------------------- */
-    if (table != TABLE_NONE) {
-        if (ptable_write(fd, &dev, table) != 0 || fsync(fd) != 0) {
+    if (o->table != TABLE_NONE) {
+        if (ptable_write(fd, &dev, o->table) != 0 || fsync(fd) != 0) {
             close(fd);
             fprintf(stderr, "safedel: data was erased, but writing the partition table failed\n");
             return 1;
         }
-        printf("  Wrote empty %s partition table.\n", table_name(table));
+        printf("  Wrote empty %s partition table.\n", table_name(o->table));
     }
     close(fd);
     if (dev.is_blockdev)
@@ -343,7 +257,114 @@ int main(int argc, char **argv)
     unsigned secs = (unsigned)(now_seconds() - t0);
     printf("\nDone. %s was securely erased in %02u:%02u:%02u.\n",
            dev.path, secs / 3600, secs / 60 % 60, secs % 60);
-    if (table != TABLE_NONE)
+    if (o->table != TABLE_NONE)
         printf("Create partitions and a filesystem with e.g. fdisk/parted and mkfs.\n");
     return 0;
+}
+
+int main(int argc, char **argv)
+{
+    static const struct option longopts[] = {
+        { "list",    no_argument,       NULL, 'l' },
+        { "method",  required_argument, NULL, 'm' },
+        { "passes",  required_argument, NULL, 'n' },
+        { "pattern", required_argument, NULL, 'p' },
+        { "verify",  no_argument,       NULL, 'V' },
+        { "table",   required_argument, NULL, 't' },
+        { "dry-run", no_argument,       NULL, 'd' },
+        { "help",    no_argument,       NULL, 'h' },
+        { NULL, 0, NULL, 0 }
+    };
+    struct options o = { .method = METHOD_AUTO, .table = TABLE_GPT,
+                         .passes = { PAT_RANDOM }, .npasses = 1 };
+    int list = 0, have_n = 0, have_p = 0;
+    int c;
+
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
+    while ((c = getopt_long(argc, argv, "lm:n:p:Vt:dh", longopts, NULL)) != -1) {
+        switch (c) {
+        case 'l':
+            list = 1;
+            break;
+        case 'm':
+            if (strcmp(optarg, "auto") == 0)
+                o.method = METHOD_AUTO;
+            else if (strcmp(optarg, "overwrite") == 0)
+                o.method = METHOD_OVERWRITE;
+            else if (strcmp(optarg, "firmware") == 0)
+                o.method = METHOD_FIRMWARE;
+            else {
+                fprintf(stderr, "safedel: unknown method '%s'\n", optarg);
+                return 2;
+            }
+            break;
+        case 'n': {
+            char *end;
+            long v = strtol(optarg, &end, 10);
+            if (*end || v < 1 || v > MAX_PASSES) {
+                fprintf(stderr, "safedel: --passes must be between 1 and %d\n", MAX_PASSES);
+                return 2;
+            }
+            o.npasses = (int)v;
+            for (int i = 0; i < o.npasses; i++)
+                o.passes[i] = PAT_RANDOM;
+            have_n = 1;
+            break;
+        }
+        case 'p':
+            o.npasses = parse_patterns(optarg, o.passes, MAX_PASSES);
+            if (o.npasses < 1)
+                return 2;
+            have_p = 1;
+            break;
+        case 'V':
+            o.verify = 1;
+            break;
+        case 't':
+            if (strcmp(optarg, "gpt") == 0)
+                o.table = TABLE_GPT;
+            else if (strcmp(optarg, "mbr") == 0)
+                o.table = TABLE_MBR;
+            else if (strcmp(optarg, "none") == 0)
+                o.table = TABLE_NONE;
+            else {
+                fprintf(stderr, "safedel: unknown table type '%s'\n", optarg);
+                return 2;
+            }
+            break;
+        case 'd':
+            o.dry_run = 1;
+            break;
+        case 'h':
+            usage(stdout, argv[0]);
+            return 0;
+        default:
+            usage(stderr, argv[0]);
+            return 2;
+        }
+    }
+    if (have_n && have_p) {
+        fprintf(stderr, "safedel: use either --passes or --pattern, not both\n");
+        return 2;
+    }
+    if (list)
+        return wizard_list();
+
+    if (optind == argc) {
+        /* no device given: interactive mode (keeps --dry-run if it was passed) */
+        char path[PATH_MAX];
+        if (!isatty(STDIN_FILENO)) {
+            usage(stderr, argv[0]);
+            return 2;
+        }
+        if (wizard_run(&o, path, sizeof path) != 0)
+            return 1;
+        return safedel_run(path, &o);
+    }
+    if (optind != argc - 1) {
+        usage(stderr, argv[0]);
+        return 2;
+    }
+    return safedel_run(argv[optind], &o);
 }

@@ -2,6 +2,7 @@
 #define SAFEDEL_DEVICE_H
 
 #include <limits.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
 
@@ -34,7 +35,12 @@ struct devinfo {
 
 int         device_probe(const char *path, struct devinfo *d);
 void        device_print(const struct devinfo *d);
-int         device_check_unused(const struct devinfo *d);
+/*
+ * Returns 0 if the disk is safe to erase. With reason == NULL every problem is
+ * printed to stderr; otherwise nothing is printed and the most important problem
+ * is stored in reason.
+ */
+int         device_check_unused(const struct devinfo *d, char *reason, size_t len);
 const char *bus_name(enum bus b);
 
 #endif

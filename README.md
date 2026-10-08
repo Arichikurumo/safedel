@@ -39,8 +39,35 @@ sudo make install   # installs to /usr/local/sbin
 
 ## Usage
 
+### Interactive mode
+
+Run `safedel` with no device to be guided through it:
+
+```
+$ sudo safedel
+safedel - interactive mode (type q or press Ctrl-D to quit)
+
+  #   DEVICE                SIZE  TYPE BUS       MODEL                     STATUS
+  1   /dev/sda        931.51 GiB  HDD  SATA/ATA  WDC WD10EZEX-08WN4A0      available
+  -   /dev/nvme0n1    931.51 GiB  SSD  NVMe      WD_BLACK SN770M 1TB       in use: nvme0n1p1 is mounted on /boot (SYSTEM DISK)
+
+Disk to erase [1-1, q to quit]:
+```
+
+Disks that are in use can't be picked. After you choose a disk, the wizard asks
+for the erase method, the number of passes, whether to verify and the partition
+table, with a sensible default for each (press Enter to accept it). It then
+shows the full plan and asks you to type the device name, the same as the flags
+do. `sudo safedel --dry-run` runs the wizard without writing anything.
+
+`safedel --list` prints the same disk table and exits.
+
+### Command line
+
 ```
 safedel [options] <device>
+
+  -l, --list           list disks and whether they can be erased
 
   -m, --method METHOD  auto (default), overwrite or firmware
   -n, --passes N       number of random overwrite passes (default 1)
